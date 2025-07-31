@@ -1,0 +1,247 @@
+"""
+Backtester module for evaluating trading strategy performance.
+"""
+import logging
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import traceback
+
+logger = logging.getLogger(__name__)
+
+class Backtester:
+    """
+    Backtests a trading strategy using historical data.
+    """
+    
+    def __init__(self, initial_capital=10000, position_size=1.0):
+        """
+        Initialize the backtester.
+        
+        Args:
+            initial_capital (float): Initial capital for backtesting
+            position_size (float): Position size as a fraction of portfolio (0-1)
+        """
+        self.initial_capital = initial_capital
+        self.position_size = position_size
+        logger.info(f"Backtester initialized with ${initial_capital} capital, {position_size*100}% position size")
+    
+    def run_backtest(self, signals_df, commission=0.001):
+        """
+        Run a backtest on the given signals dataframe.
+        
+        Args:
+            signals_df (pandas.DataFrame): DataFrame with price data and signals
+            commission (float): Commission rate as a fraction of trade value
+            
+        Returns:
+            dict: Backtest results
+        """
+        try:
+            # Check if DataFrame is empty
+            if len(signals_df) == 0:
+                logger.error("Cannot run backtest on empty DataFrame")
+                return {
+                    'success': False,
+                    'error': 'Empty signals DataFrame'
+                }
+            
+            # Make a copy to avoid modifying the original
+            backtest_df = signals_df.copy()
+            
+            # Initialize portfolio columns with explicit float dtypes
+            backtest_df['holdings'] = 0.0
+            backtest_df['cash'] = float(self.initial_capital)
+            backtest_df['portfolio'] = float(self.initial_capital)
+            backtest_df['returns'] = 0.0
+            
+            # Add price returns for benchmark
+            try:
+                backtest_df['price_returns'] = backtest_df['Close'].pct_change()
+            except Exception as e:
+                logger.warning(f"Error calculating price returns: {str(e)}")
+            
+            # Helper function to safely get values from DataFrame
+            def safe_get(df, idx, col):
+                try:
+                    # Handle MultiIndex columns
+                    if isinstance(df.columns, pd.MultiIndex):
+                        for column in df.columns:
+                            if isinstance(column, tuple) and col in column:
+                                value = df[column].iloc[idx]
+                                if hasattr(value, 'iloc'):
+                                    return float(value.iloc[0])
+                                return float(value)
+                    
+                    # Handle standard columns
+                    value = df[col].iloc[idx]
+                    if hasattr(value, 'iloc'):
+                        return float(value.iloc[0])
+                    return float(value)
+                except Exception as e:
+                    logger.debug(f"Error getting value for {col} at index {idx}: {str(e)}")
+                    return 0.0
+            
+            # Execute trading simulation
+            for i in range(1, len(backtest_df)):
+                try:
+                    # Get previous position and cash
+                    prev_holdings = safe_get(backtest_df, i-1, 'holdings')
+                    prev_cash = safe_get(backtest_df, i-1, 'cash')
+                    
+                    # Get current price and signal
+                    curr_price = safe_get(backtest_df, i, 'Close')
+                    position_signal = safe_get(backtest_df, i, 'position')
+                    
+                    # Update based on position signal
+                    if position_signal > 0:  # Buy signal
+                        max_shares = (prev_cash * self.position_size) / (curr_price * (1 + commission))
+                        backtest_df.loc[backtest_df.index[i], 'holdings'] = float(max_shares)
+                        backtest_df.loc[backtest_df.index[i], 'cash'] = float(prev_cash - (max_shares * curr_price * (1 + commission)))
+                    elif position_signal < 0:  # Sell signal
+                        backtest_df.loc[backtest_df.index[i], 'cash'] = float(prev_cash + (prev_holdings * curr_price * (1 - commission)))
+                        backtest_df.loc[backtest_df.index[i], 'holdings'] = 0.0
+                    else:  # Hold position
+                        backtest_df.loc[backtest_df.index[i], 'holdings'] = float(prev_holdings)
+                        backtest_df.loc[backtest_df.index[i], 'cash'] = float(prev_cash)
+                    
+                    # Calculate portfolio value
+                    holdings_value = safe_get(backtest_df, i, 'holdings') * curr_price
+                    cash_value = safe_get(backtest_df, i, 'cash')
+                    portfolio_value = holdings_value + cash_value
+                    backtest_df.loc[backtest_df.index[i], 'portfolio'] = float(portfolio_value)
+                    
+                    # Calculate return
+                    prev_portfolio = safe_get(backtest_df, i-1, 'portfolio')
+                    if prev_portfolio > 0:
+                        return_value = (portfolio_value / prev_portfolio) - 1
+                        backtest_df.loc[backtest_df.index[i], 'returns'] = float(return_value)
+                except Exception as e:
+                    logger.warning(f"Error in iteration {i}: {str(e)}")
+            
+            # Calculate performance metrics
+            metrics = self._calculate_performance_metrics(backtest_df)
+            
+            # Count signals
+            signal_count = 0
+            for i in range(len(backtest_df)):
+                try:
+                    pos = safe_get(backtest_df, i, 'position')
+                    if pos != 0:
+                        signal_count += 1
+                except Exception:
+                    pass
+            
+            # Prepare final portfolio value and returns
+            final_portfolio = safe_get(backtest_df, -1, 'portfolio')
+            initial_close = safe_get(backtest_df, 0, 'Close')
+            final_close = safe_get(backtest_df, -1, 'Close')
+            
+            total_return = (final_portfolio / self.initial_capital) - 1
+            buy_hold_return = (final_close / initial_close) - 1 if initial_close > 0 else 0
+            
+            # Prepare results
+            results = {
+                'success': True,
+                'signals_count': signal_count,
+                'final_portfolio': final_portfolio,
+                'total_return': total_return,
+                'buy_and_hold_return': buy_hold_return,
+                'metrics': metrics,
+                'backtest_df': backtest_df,
+                'summary': f"Strategy returned {metrics['total_return_pct']:.2f}% vs buy-and-hold {metrics['buy_hold_return_pct']:.2f}%"
+            }
+            
+            logger.info(f"Backtest completed: {results['summary']}")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Backtesting failed: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def _calculate_performance_metrics(self, backtest_df):
+        """
+        Calculate performance metrics for the backtest.
+        
+        Args:
+            backtest_df (pandas.DataFrame): DataFrame with backtest results
+            
+        Returns:
+            dict: Performance metrics
+        """
+        try:
+            # Helper function to safely get values
+            def safe_get(df, idx, col):
+                try:
+                    # Handle MultiIndex columns
+                    if isinstance(df.columns, pd.MultiIndex):
+                        for column in df.columns:
+                            if isinstance(column, tuple) and col in column:
+                                value = df[column].iloc[idx]
+                                if hasattr(value, 'iloc'):
+                                    return float(value.iloc[0])
+                                return float(value)
+                    
+                    # Handle standard columns
+                    value = df[col].iloc[idx]
+                    if hasattr(value, 'iloc'):
+                        return float(value.iloc[0])
+                    return float(value)
+                except Exception:
+                    return 0.0
+            
+            # Calculate returns
+            final_portfolio = safe_get(backtest_df, -1, 'portfolio')
+            initial_close = safe_get(backtest_df, 0, 'Close')
+            final_close = safe_get(backtest_df, -1, 'Close')
+            
+            total_return = (final_portfolio / self.initial_capital) - 1
+            buy_hold_return = (final_close / initial_close) - 1 if initial_close > 0 else 0
+            
+            # Convert to percentages
+            total_return_pct = total_return * 100
+            buy_hold_return_pct = buy_hold_return * 100
+            
+            # Return metrics dict
+            return {
+                'total_return': total_return,
+                'total_return_pct': total_return_pct,
+                'buy_hold_return': buy_hold_return,
+                'buy_hold_return_pct': buy_hold_return_pct,
+                'alpha': total_return - buy_hold_return,
+                'max_drawdown': 0.0,  # Simplified
+                'sharpe_ratio': 0.0,   # Simplified
+                'win_rate': 0.0        # Simplified
+            }
+        except Exception as e:
+            logger.warning(f"Error calculating performance metrics: {str(e)}")
+            return {
+                'total_return': 0.0,
+                'total_return_pct': 0.0,
+                'buy_hold_return': 0.0,
+                'buy_hold_return_pct': 0.0,
+                'alpha': 0.0,
+                'max_drawdown': 0.0,
+                'sharpe_ratio': 0.0,
+                'win_rate': 0.0
+            }
+    
+    def _extract_trade_history(self, backtest_df):
+        """
+        Extract trade history from backtest results.
+        
+        Args:
+            backtest_df (pandas.DataFrame): DataFrame with backtest results
+            
+        Returns:
+            list: List of trade dictionaries
+        """
+        try:
+            # Simplified implementation
+            return []
+        except Exception as e:
+            logger.warning(f"Error extracting trade history: {str(e)}")
+            return []
